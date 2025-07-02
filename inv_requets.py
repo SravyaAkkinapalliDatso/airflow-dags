@@ -23,7 +23,6 @@ def create_inventory_tables():
                     request_key SERIAL PRIMARY KEY,
                     request_id TEXT UNIQUE,
                     property_id TEXT,
-                    project_id TEXT,
                     item_key INT REFERENCES {TARGET_SCHEMA}.d_item(item_key),
                     quantity NUMERIC,
                     status TEXT,
@@ -43,7 +42,6 @@ def load_inventory_requests():
     data = src.get_records("""
         SELECT 
             ir.request_id,
-            ir.project_id,
             ir.property_id,
             ir.item_name,
             ir.category,
@@ -59,8 +57,10 @@ def load_inventory_requests():
     with dest.get_conn() as conn:
         with conn.cursor() as cur:
             for row in data:
-                (request_id, project_id, property_id, item_name, category, unit,
-                 quantity, status, raised_at, updated_at) = row
+                (
+                    request_id, property_id, item_name, category, unit,
+                    quantity, status, raised_at, updated_at
+                ) = row
 
                 raised_date_key = date_to_key(raised_at)
                 updated_date_key = date_to_key(updated_at)
@@ -82,16 +82,16 @@ def load_inventory_requests():
                 # Insert fact with deduplication
                 cur.execute(f"""
                     INSERT INTO {TARGET_SCHEMA}.fact_inventory_requests (
-                        request_id, property_id, project_id, item_key,
+                        request_id, property_id, item_key,
                         quantity, status, raised_date_key, updated_date_key
                     )
-                    SELECT %s, %s, %s, %s, %s, %s, %s, %s
+                    SELECT %s, %s, %s, %s, %s, %s, %s
                     WHERE NOT EXISTS (
                         SELECT 1 FROM {TARGET_SCHEMA}.fact_inventory_requests
                         WHERE request_id = %s
                     )
                 """, (
-                    request_id, property_id, project_id, item_key,
+                    request_id, property_id, item_key,
                     quantity, status, raised_date_key, updated_date_key,
                     request_id
                 ))
@@ -112,6 +112,7 @@ dag = DAG(
     description='ETL for inventory requests into analytics schema',
     schedule_interval='@hourly',
     catchup=False,
+    tags=['inventory', 'etl']
 )
 
 create_tables_task = PythonOperator(
