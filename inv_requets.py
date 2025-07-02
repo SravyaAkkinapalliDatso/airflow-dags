@@ -107,7 +107,7 @@ default_args = {
 }
 
 dag = DAG(
-    dag_id='inventory_requests_etl',
+    dag_id='inv_rqst_etl',
     default_args=default_args,
     description='ETL for inventory requests into analytics schema',
     schedule_interval='@hourly',
