@@ -7,9 +7,14 @@ from urllib.parse import quote_plus
 import logging
 
 # =======================
+# ✅ Setup Logging
+# =======================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =======================
 # ✅ Utility Functions
 # =======================
-
 def get_engine(conn_id):
     hook = PostgresHook(postgres_conn_id=conn_id)
     conn = hook.get_connection(conn_id)
@@ -17,6 +22,7 @@ def get_engine(conn_id):
     return create_engine(uri)
 
 def insert_date_if_missing(conn, date_value):
+    logger.debug(f"📅 Ensuring date in d_date: {date_value}")
     with conn.begin():
         conn.execute(text("""
             INSERT INTO analytics.d_date (date, year, month, day, day_of_week, week_of_year, quarter)
@@ -33,6 +39,7 @@ def insert_date_if_missing(conn, date_value):
         """), {"date": date_value})
 
 def insert_if_missing(conn, table, column, value):
+    logger.debug(f"🧩 Ensuring {value} exists in {table}.{column}")
     with conn.begin():
         conn.execute(text(f"""
             INSERT INTO analytics.{table} ({column})
@@ -41,15 +48,16 @@ def insert_if_missing(conn, table, column, value):
         """), {"value": value})
 
 # =======================
-# 🚀 Main ETL Logic from Payload
+# 🚀 Main ETL Logic
 # =======================
-
 def load_inventory_requests_from_payload(**kwargs):
     conf = kwargs["dag_run"].conf or {}
-    records = conf.get("records", [])
+    logger.info("📥 Received payload:")
+    logger.info(conf)
 
+    records = conf.get("records", [])
     if not records or not isinstance(records, list):
-        logging.warning("❌ No valid 'records' provided in DAG payload.")
+        logger.warning("❌ No valid 'records' provided in DAG payload.")
         return
 
     dest_engine = get_engine('superset')
@@ -57,6 +65,7 @@ def load_inventory_requests_from_payload(**kwargs):
 
     with dest_engine.connect() as conn:
         for row in records:
+            logger.info(f"🔍 Processing row: {row}")
             request_id = row.get("request_id")
             item_name = row.get("item_name")
             quantity = row.get("quantity")
@@ -64,21 +73,21 @@ def load_inventory_requests_from_payload(**kwargs):
             requested_date_str = row.get("requested_date")
 
             if not all([request_id, item_name, quantity, location, requested_date_str]):
-                logging.warning(f"⚠️ Skipping incomplete record: {row}")
+                logger.warning(f"⚠️ Incomplete record: {row}")
                 continue
 
             try:
                 requested_date = datetime.strptime(requested_date_str, "%Y-%m-%d").date()
             except ValueError:
-                logging.warning(f"⚠️ Invalid date format for request_id {request_id}")
+                logger.warning(f"⚠️ Invalid date format for request_id {request_id}: {requested_date_str}")
                 continue
 
-            # Ensure dimensions
+            # Insert dimension records if missing
             insert_date_if_missing(conn, requested_date)
             insert_if_missing(conn, "d_item", "item_name", item_name)
             insert_if_missing(conn, "d_project", "project_name", location)
 
-            # Lookups
+            # Look up dimension keys
             date_key = conn.execute(text("SELECT date_key FROM analytics.d_date WHERE date = :date"),
                                     {"date": requested_date}).scalar()
             item_key = conn.execute(text("SELECT item_key FROM analytics.d_item WHERE item_name = :val"),
@@ -86,42 +95,45 @@ def load_inventory_requests_from_payload(**kwargs):
             project_key = conn.execute(text("SELECT project_key FROM analytics.d_project WHERE project_name = :val"),
                                        {"val": location}).scalar()
 
+            logger.debug(f"🔑 Keys for request_id {request_id} → date_key={date_key}, item_key={item_key}, project_key={project_key}")
+
             if not all([date_key, item_key, project_key]):
-                logging.warning(f"⚠️ Skipping request_id {request_id} — missing dimension key(s)")
+                logger.warning(f"⚠️ Skipping request_id {request_id} — missing keys")
                 continue
 
-            # Insert/Upsert into fact table
-            with conn.begin():
-                conn.execute(text("""
-                    INSERT INTO analytics.f_inventory_requests (
-                        request_id, item_key, quantity, project_key, date_key
-                    )
-                    VALUES (
-                        :request_id, :item_key, :quantity, :project_key, :date_key
-                    )
-                    ON CONFLICT (request_id) DO UPDATE SET
-                        item_key = EXCLUDED.item_key,
-                        quantity = EXCLUDED.quantity,
-                        project_key = EXCLUDED.project_key,
-                        date_key = EXCLUDED.date_key
-                """), {
-                    "request_id": request_id,
-                    "item_key": item_key,
-                    "quantity": quantity,
-                    "project_key": project_key,
-                    "date_key": date_key
-                })
-                upserted += 1
-                logging.info(f"✅ Upserted request_id: {request_id}")
+            try:
+                with conn.begin():
+                    conn.execute(text("""
+                        INSERT INTO analytics.f_inventory_requests (
+                            request_id, item_key, quantity, project_key, date_key
+                        )
+                        VALUES (
+                            :request_id, :item_key, :quantity, :project_key, :date_key
+                        )
+                        ON CONFLICT (request_id) DO UPDATE SET
+                            item_key = EXCLUDED.item_key,
+                            quantity = EXCLUDED.quantity,
+                            project_key = EXCLUDED.project_key,
+                            date_key = EXCLUDED.date_key
+                    """), {
+                        "request_id": request_id,
+                        "item_key": item_key,
+                        "quantity": quantity,
+                        "project_key": project_key,
+                        "date_key": date_key
+                    })
+                    upserted += 1
+                    logger.info(f"✅ Upserted request_id: {request_id}")
+            except Exception as e:
+                logger.error(f"❌ Failed to upsert request_id {request_id}: {e}")
 
-    logging.info(f"🎯 Finished. Total inserted/updated: {upserted} record(s).")
+    logger.info(f"🏁 Finished ETL. Total upserted: {upserted} record(s)")
 
 # =======================
 # 🗓️ DAG Definition
 # =======================
-
 with DAG(
-    dag_id='inventory_requests_etl_from_payload',
+    dag_id='inventory_requests_etl_from_payload_1',
     start_date=datetime(2025, 7, 1),
     schedule_interval=None,
     catchup=False,
